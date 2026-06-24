@@ -50,6 +50,7 @@ class Copilot(AbstractProvider):
             return_conversation: bool = False,
             cookies: Dict[str, str] = None,
             access_token: str = None,
+            identity_type: str = None,
             **kwargs
         ):
         """Stream a Copilot reply to ``prompt``.
@@ -96,6 +97,10 @@ class Copilot(AbstractProvider):
         websocket_url = f"{self.websocket_url}&clientSessionId={uuid.uuid4()}"
         if access_token:
             websocket_url = f"{websocket_url}&accessToken={quote(access_token)}"
+            # Federated (Google) tokens ride an extra identity-type marker on the
+            # real client's socket; replay it so the upgrade isn't rejected.
+            if identity_type:
+                websocket_url = f"{websocket_url}&X-UserIdentityType={quote(identity_type)}"
 
         with Session(
             timeout=timeout,

@@ -11,7 +11,7 @@ You can use it in two ways:
 - 🐍 **As a Python library:** just call `client.chat("Hi")`. Supports streaming and multi-turn conversations.
 - 🔌 **As a local OpenAI-compatible API:** runs a server at `http://localhost:8000/v1` that speaks the OpenAI format, so the official `openai` SDK (and any OpenAI-compatible app) works as a drop-in, with `localhost` in place of OpenAI.
 
-You sign in once with your Microsoft account in a browser; your session is saved and refreshed automatically after that.
+You sign in once in a browser with your Microsoft **or Google** account; your session is saved and refreshed automatically after that.
 
 > **Unofficial project.** Not affiliated with or endorsed by Microsoft. It automates the consumer Copilot web experience for personal use, so use it responsibly and within Microsoft's terms.
 
@@ -69,11 +69,11 @@ pip install -r requirements.txt
 # Install the browser Playwright needs (one-time)
 playwright install chromium
 
-# Sign in once: a browser opens, log into your Microsoft account
+# Sign in once: a browser opens, log into your Microsoft or Google account
 python -m copilot login
 ```
 
-The browser **closes by itself** once sign-in is detected — you don't need to press Enter or close it manually. The steps are logged to `session/login.log` if anything goes wrong. That's it: your session is saved under `session/` (git-ignored, never shared) and reused on every run.
+The browser **closes by itself** once sign-in is detected — you don't need to press Enter or close it manually. After sign-in it sends one short warm-up message to mint the chat token (so a brief "finishing setup…" appears, and a tiny throwaway chat lands in your history). The steps are logged to `session/login.log` if anything goes wrong. That's it: your session is saved under `session/` (git-ignored, never shared) and reused on every run.
 
 > 💡 You can even skip step 3: the **first** time you call `chat()` or start the server, it opens the sign-in browser for you automatically.
 

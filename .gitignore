@@ -8,6 +8,7 @@ venv/
 # clearance, sign-in) + cached auth token. Secret.
 session/
 docs/
+session.*
 
 # Local config / secrets
 config.json

@@ -1,71 +1,46 @@
-"""Browser-backed Copilot driver.
+"""Browser-backed sign-in and chat-token capture.
 
-A Playwright fallback for the pure-HTTP :class:`copilot.client.Copilot`: it runs
-the *exact same protocol* inside a real browser that already holds Cloudflare
-clearance and (optionally) a signed-in Microsoft session. Useful if Microsoft
-ever escalates the challenge to a Cloudflare Turnstile CAPTCHA, which needs a
-browser-solved token.
+Playwright support for the pure-HTTP :class:`copilot.client.Copilot`: it does NOT
+chat. Its sole job is to establish and refresh the signed-in session that the
+HTTP driver runs on — interactive Microsoft/Google login plus headless capture of
+the Copilot chat token.
 
 ``BrowserCopilot`` launches a **persistent** Playwright Chromium profile so that
-Cloudflare clearance and any sign-in survive restarts. The chat protocol
-(``POST /c/api/conversations`` then a ``wss://.../c/api/chat`` WebSocket speaking
-``send`` -> ``appendText``* -> ``done``) is executed *in the page* via
-``page.evaluate`` so the browser's own ``fetch``/``WebSocket`` carry the cookies,
-Cloudflare token, and auth headers.
+Cloudflare clearance and any sign-in survive restarts. Two responsibilities:
 
-It exposes the same ``create_completion(prompt, stream=...)`` generator API as
-:class:`copilot.client.Copilot`, so it is a drop-in replacement.
+  * :meth:`login` — opens a visible window for interactive sign-in, then warms up
+    one chat turn to mint the token and snapshots ``session/token.json``.
+  * :meth:`acquire_chat_token` — headless: returns the chat token, warming up a
+    turn to mint/capture it when the MSAL cache can't be read directly.
 
-PROTOCOL ASSUMPTIONS (verify at runtime against a live session):
-  * Conversation create:  POST /c/api/conversations  -> {"id": "..."}
-  * Chat socket:          wss://copilot.microsoft.com/c/api/chat?api-version=2
-                          &clientSessionId=<uuid> (with &accessToken=<token> when
-                          signed in)
-  * Handshake:            send SET_OPTIONS_FRAME then CONSENTS_FRAME before the
-                          first send, or the backend returns invalid-event
-  * Send frame:           {"event":"send","conversationId":...,
-                           "content":[{"type":"text","text":...}],
-                           "mode":"smart","context":{}}
-  * Stream frames:        {"event":"appendText","text":...}, then {"event":"done"}
-The wire shapes are the single source of truth in :mod:`copilot.protocol`; these
-JS templates just replay them. Recapture with ``tests/diagnostic.py`` if Microsoft
-changes the protocol.
+Why a warm-up + WebSocket capture (not a localStorage read): federated *Google*
+logins store the MSAL token cache **encrypted** and only mint the
+``ChatAI.ReadWrite`` token on the first chat turn. So the token can't be read
+from storage; instead we let the page open its own ``wss://.../c/api/chat``
+socket and read ``accessToken`` (and ``X-UserIdentityType``) straight off that
+URL — see :meth:`_install_ws_listener`. Microsoft logins expose a readable token
+and skip the warm-up entirely.
+
+All actual chatting lives in :mod:`copilot.driver` (pure HTTP). Recapture token
+shapes with ``tests/diagnostic.py`` if Microsoft changes them.
 """
 
 from __future__ import annotations
 
 import json
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Generator, Optional
-from urllib.parse import quote
+from typing import Dict, Optional
+from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import sync_playwright, Error as PlaywrightError
 
 from .auth import DEFAULT_AUTH_FILE, DEFAULT_PROFILE_DIR
-from .protocol import CHAT_WEBSOCKET_URL, CONSENTS_FRAME, SET_OPTIONS_FRAME
 
 COPILOT_URL = "https://copilot.microsoft.com/"
 
 # --- in-page JavaScript -----------------------------------------------------
-
-# Create a conversation. Runs in the page so cookies/Cloudflare apply.
-_CREATE_CONVERSATION_JS = """
-async () => {
-  const res = await fetch('/c/api/conversations', {
-    method: 'POST',
-    credentials: 'include',
-    headers: {'content-type': 'application/json'},
-  });
-  const text = await res.text();
-  if (!res.ok) return {ok: false, status: res.status, text: text};
-  let data = {};
-  try { data = JSON.parse(text); } catch (e) {}
-  return {ok: true, id: data.id || data.conversationId || null, raw: text};
-}
-"""
 
 # Discover the Copilot chat MSAL access token from localStorage. The cache holds
 # several tokens for different scopes; the chat WebSocket only accepts the one
@@ -98,48 +73,29 @@ _FIND_TOKEN_JS = """
 }
 """
 
-# Open the chat WebSocket and wire handlers that push into a window-scoped
-# buffer. Returns immediately; messages accumulate while Python polls.
-_START_STREAM_JS = """
-([url, conversationId, prompt, prelude]) => {
-  const state = {queue: [], done: false, error: null, started: false};
-  window.__copilot = state;
-  let ws;
-  try { ws = new WebSocket(url); } catch (e) { state.error = 'ws-init: ' + e; state.done = true; return false; }
-  window.__copilotWs = ws;
-  ws.onopen = () => {
-    // Initialise the session (setOptions, reportLocalConsents) before sending,
-    // or the backend rejects `send` with invalid-event.
-    for (const frame of prelude) ws.send(JSON.stringify(frame));
-    ws.send(JSON.stringify({
-      event: 'send',
-      conversationId: conversationId,
-      content: [{type: 'text', text: prompt}],
-      mode: 'smart',
-      context: {}
-    }));
-  };
-  ws.onmessage = (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch (e) { return; }
-    const e = msg.event;
-    if (e === 'appendText') { state.started = true; if (msg.text) state.queue.push(msg.text); }
-    else if (e === 'done') { state.done = true; try { ws.close(); } catch (x) {} }
-    else if (e === 'error') { state.error = JSON.stringify(msg); state.done = true; try { ws.close(); } catch (x) {} }
-  };
-  ws.onerror = () => { state.error = state.error || 'websocket error'; state.done = true; };
-  ws.onclose = () => { state.done = true; };
-  return true;
-}
-"""
-
-# Drain the buffer and report status in one round-trip.
-_POLL_JS = """
+# True once the user is signed in, *before* the chat token is minted. MSAL writes
+# an `msal.*.account.keys` index (a non-empty list of cached accounts) the moment
+# sign-in completes — and, crucially, this index is NOT encrypted even when the
+# token cache itself is, so it is a reliable sign-in signal for every account
+# type (Microsoft *and* federated Google). We deliberately do not key off the
+# ChatAI access token here: for Google logins MSAL stores the token cache
+# *encrypted* ({id,nonce,data,...}) and only mints the chat token on the first
+# chat turn, so waiting for it during login would never succeed (see login()).
+_SIGNED_IN_JS = """
 () => {
-  const s = window.__copilot || {queue: [], done: true, error: 'not started', started: false};
-  const q = s.queue;
-  s.queue = [];
-  return {q: q, done: s.done, error: s.error, started: s.started};
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf('account.keys') !== -1) {
+        try {
+          const a = JSON.parse(localStorage.getItem(k) || 'null');
+          if (Array.isArray(a) ? a.length > 0 : (a && Object.keys(a).length > 0))
+            return true;
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  return false;
 }
 """
 
@@ -179,6 +135,12 @@ class BrowserCopilot:
         self._context = None
         self._page = None
         self._login_log_fh = None
+        # Chat token captured live off the page's own chat WebSocket. This is the
+        # only way to recover the token for sessions whose MSAL cache is encrypted
+        # (e.g. federated Google logins), where _FIND_TOKEN_JS cannot read it.
+        self._captured_chat_token: Optional[str] = None
+        self._captured_identity_type: Optional[str] = None
+        self._ws_listener_installed = False
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -261,17 +223,25 @@ class BrowserCopilot:
     # -- auth ---------------------------------------------------------------
 
     def login(self, path: str = DEFAULT_AUTH_FILE, timeout: int = 300) -> dict:
-        """Open a visible window for interactive Microsoft sign-in.
+        """Open a visible window for interactive Microsoft/Google sign-in.
 
-        Auto-detects success — the Copilot chat access token appearing in the
-        page, the same signal :mod:`copilot.auth` uses — then snapshots the
-        session and closes the browser by itself. No key-press needed. Every step
-        is appended to ``<session>/login.log`` so a failed sign-in is diagnosable.
-        ``timeout`` bounds the wait before giving up and snapshotting whatever
-        state exists. The session persists in ``profile_dir`` for headless reuse.
+        Auto-detects success — a cached account appearing in the page (the moment
+        sign-in completes, see :data:`_SIGNED_IN_JS`) — then **warms up** the
+        session with one throwaway chat turn to mint the Copilot chat token and
+        captures it off the page's own chat WebSocket. This warm-up is what makes
+        federated *Google* logins work: their MSAL cache is encrypted and the chat
+        token is only minted on the first turn, so the old "wait for the token in
+        localStorage" approach timed out (~5 min) and saved a null token.
+        Microsoft accounts already have a readable token, so the warm-up returns
+        instantly and their flow is unchanged.
+
+        No key-press needed; the browser closes itself. Every step is appended to
+        ``<session>/login.log``. ``timeout`` bounds the wait. The session persists
+        in ``profile_dir`` for headless reuse.
         """
         self.close()
         self.start(headless=False)
+        self._install_ws_listener()
 
         log = self._open_login_log(Path(path).resolve().parent / "login.log")
         log(f"login started; browser open at {COPILOT_URL}")
@@ -280,23 +250,19 @@ class BrowserCopilot:
         print(
             "\nA browser window is open at copilot.microsoft.com.\n"
             "Sign in (and pass any 'verify you're human' check).\n"
-            "It closes by itself once sign-in is detected — no need to press Enter.\n"
+            "It finishes by itself once sign-in is detected — no need to press Enter.\n"
         )
 
-        # Poll for the signed-in chat token; bail early if the user closes the
-        # window or the timeout elapses.
+        # Wait for sign-in (a cached account), not for the chat token: the token
+        # may not exist until the first turn. Bail early on window close/timeout.
         detected = False
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._window_closed():
                 log("browser window closed before sign-in was detected")
                 break
-            try:
-                token = self.access_token()
-            except PlaywrightError:
-                token = None
-            if token:
-                log("chat access token detected — sign-in successful")
+            if self.signed_in():
+                log("sign-in detected (account cached)")
                 detected = True
                 break
             try:
@@ -304,17 +270,26 @@ class BrowserCopilot:
             except PlaywrightError:
                 break
 
-        if not detected:
-            log(f"no chat access token within {timeout}s; snapshotting current state")
-            print("Sign-in not auto-detected; saving whatever session state exists.")
+        token = None
+        if detected:
+            print("Signed in — finishing setup (sending a warm-up message)...")
+            log("warming up to mint/capture the chat token")
+            try:
+                token = self.acquire_chat_token(timeout=max(30, int(deadline - time.time())))
+            except PlaywrightError as exc:
+                log(f"warm-up error: {exc}")
+            log(f"chat token captured: {'yes' if token else 'no'}"
+                f" (identity={self._captured_identity_type})")
+        else:
+            log(f"not signed in within {timeout}s; snapshotting current state")
+            print("Sign-in not detected; saving whatever session state exists.")
 
-        # Let cookies/token settle, then snapshot for the headless curl_cffi path.
+        # Snapshot for the headless curl_cffi path.
         auth: dict = {}
         try:
-            if detected and not self._window_closed():
-                self._page.wait_for_timeout(800)
             auth = self.export_auth(path=path, stamp=time.time())
-            log(f"auth snapshot saved to {path} (access_token={'yes' if auth.get('access_token') else 'no'})")
+            log(f"auth snapshot saved to {path} (access_token={'yes' if auth.get('access_token') else 'no'}"
+                f", identity={auth.get('identity_type')})")
             print(f"Auth snapshot saved to {path}")
         except Exception as exc:
             log(f"could not snapshot auth: {exc}")
@@ -371,12 +346,126 @@ class BrowserCopilot:
             return True
 
     def access_token(self) -> Optional[str]:
-        """Return the page's MSAL access token, or ``None`` if anonymous."""
+        """Return the Copilot chat token, or ``None`` if not available.
+
+        Prefers a token captured live off the page's own chat WebSocket (the only
+        source that works when the MSAL cache is encrypted, e.g. Google logins),
+        and otherwise falls back to reading the unencrypted MSAL cache via
+        ``_FIND_TOKEN_JS`` (Microsoft logins). Call :meth:`acquire_chat_token`
+        first to ensure one of these is populated.
+        """
+        if self._captured_chat_token:
+            return self._captured_chat_token
         self._ensure_started()
         try:
             return self._page.evaluate(_FIND_TOKEN_JS)
         except PlaywrightError:
             return None
+
+    def signed_in(self) -> bool:
+        """True once a Microsoft/Google account is cached (sign-in complete)."""
+        self._ensure_started()
+        try:
+            return bool(self._page.evaluate(_SIGNED_IN_JS))
+        except PlaywrightError:
+            return False
+
+    def _install_ws_listener(self) -> None:
+        """Capture the chat token off the page's own chat WebSocket.
+
+        The page opens ``wss://.../c/api/chat?...&accessToken=<token>`` (plus, for
+        federated logins, ``&X-UserIdentityType=google``) when it sends a turn.
+        Reading the token here is encryption-proof: the page has already decrypted
+        it. parse_qs URL-decodes the value, so we store the raw token (the drivers
+        re-quote it when building their own socket URL)."""
+        if self._ws_listener_installed or self._page is None:
+            return
+
+        def on_ws(ws):
+            try:
+                url = ws.url
+                if "/c/api/chat" not in url or "accessToken=" not in url:
+                    return
+                q = parse_qs(urlparse(url).query)
+                tok = (q.get("accessToken") or [None])[0]
+                if tok:
+                    self._captured_chat_token = tok
+                    self._captured_identity_type = (q.get("X-UserIdentityType") or [None])[0]
+            except Exception:
+                pass
+
+        try:
+            self._page.on("websocket", on_ws)
+            self._ws_listener_installed = True
+        except PlaywrightError:
+            pass
+
+    def _send_warmup(self, text: str = "hi") -> bool:
+        """Send one message through the page composer to mint the chat token.
+
+        Returns True if a send was attempted. Federated (Google) sessions only
+        mint the ChatAI token on the first chat turn, so we trigger one here and
+        let :meth:`_install_ws_listener` capture the token off the resulting
+        socket."""
+        for sel in ("textarea", "div[contenteditable='true']", "[role='textbox']"):
+            try:
+                self._page.wait_for_selector(sel, state="visible", timeout=8000)
+            except PlaywrightError:
+                continue
+            try:
+                self._page.click(sel)
+                self._page.keyboard.type(text, delay=15)
+                self._page.keyboard.press("Enter")
+                return True
+            except PlaywrightError:
+                continue
+        return False
+
+    def acquire_chat_token(
+        self, timeout: int = 60, warmup: bool = True, signin_grace: int = 8
+    ) -> Optional[str]:
+        """Return a usable chat token, minting it via a warm-up turn if needed.
+
+        Fast path: a token already readable (captured, or unencrypted MSAL cache)
+        is returned immediately — this is the common Microsoft case. Otherwise, if
+        ``warmup`` and the user is signed in, send one throwaway message and
+        capture the token off the chat WebSocket (the encrypted-cache / Google
+        case). Returns ``None`` if no token could be obtained within ``timeout``.
+
+        ``signin_grace`` bounds how long we wait for an *existing* sign-in to
+        register before giving up. A headless refresh can't perform interactive
+        sign-in, so on a not-signed-in profile we bail after this short grace
+        instead of blocking the full ``timeout`` — that wait is what made the
+        no-session path feel hung before it fell through to a visible login.
+        Sign-in normally registers within ~1-2s of page load (an already-signed-in
+        profile passes the grace immediately).
+        """
+        self._ensure_started()
+        self._install_ws_listener()
+
+        tok = self.access_token()
+        if tok or not warmup:
+            return tok
+
+        deadline = time.time() + timeout
+        signin_deadline = time.time() + min(signin_grace, timeout)
+        while time.time() < signin_deadline and not self.signed_in():
+            if self._window_closed():
+                return None
+            self._page.wait_for_timeout(500)
+        if not self.signed_in():
+            return None
+
+        if not self._send_warmup():
+            return self.access_token()
+
+        while time.time() < deadline:
+            if self._captured_chat_token:
+                return self._captured_chat_token
+            if self._window_closed():
+                break
+            self._page.wait_for_timeout(500)
+        return self.access_token()
 
     def cookies(self) -> Dict[str, str]:
         """Return the signed-in Microsoft cookies as a name->value dict."""
@@ -396,6 +485,9 @@ class BrowserCopilot:
         auth = {
             "cookies": self.cookies(),
             "access_token": self.access_token(),
+            # Federated logins (Google) ride an extra &X-UserIdentityType= on the
+            # chat socket; the drivers replay it. None for Microsoft accounts.
+            "identity_type": self._captured_identity_type,
             "saved_at": stamp if stamp is not None else 0,
         }
         dest = Path(path)
@@ -403,79 +495,7 @@ class BrowserCopilot:
         dest.write_text(json.dumps(auth, indent=2), encoding="utf-8")
         return auth
 
-    # -- chat ---------------------------------------------------------------
-
-    def create_completion(
-        self,
-        prompt: str,
-        stream: bool = False,
-        timeout: int = 900,
-        **kwargs,
-    ) -> Generator[str, None, None]:
-        """Stream a Copilot reply to ``prompt``. Mirrors ``Copilot.create_completion``.
-
-        Yields text chunks as they arrive. ``stream`` is accepted for API
-        compatibility; chunks are always produced incrementally.
-        """
-        self._ensure_started()
-
-        if self.region_blocked():
-            raise RuntimeError(
-                "Microsoft Copilot is not available in your region. "
-                "Route the browser through a proxy/VPN in a supported region, e.g.:\n"
-                "    BrowserCopilot(proxy='http://user:pass@host:port')\n"
-                "or 'socks5://host:port'. See README for details."
-            )
-
-        conv = self._page.evaluate(_CREATE_CONVERSATION_JS)
-        if not conv.get("ok"):
-            status = conv.get("status")
-            body = (conv.get("text") or "")[:500]
-            if status in (401, 403):
-                raise RuntimeError(
-                    f"Conversation create returned HTTP {status}. "
-                    f"Run login() / `python -m copilot login` to sign in. Body: {body}"
-                )
-            raise RuntimeError(f"Conversation create failed (HTTP {status}): {body}")
-
-        conversation_id = conv.get("id")
-        if not conversation_id:
-            raise RuntimeError(f"No conversation id in response: {conv.get('raw')!r}")
-
-        token = self._page.evaluate(_FIND_TOKEN_JS)
-
-        ws_url = f"{CHAT_WEBSOCKET_URL}&clientSessionId={uuid.uuid4()}"
-        if token:
-            ws_url += f"&accessToken={quote(token)}"
-        prelude = [SET_OPTIONS_FRAME, CONSENTS_FRAME]
-        started_ok = self._page.evaluate(_START_STREAM_JS, [ws_url, conversation_id, prompt, prelude])
-        if started_ok is False:
-            state = self._page.evaluate(_POLL_JS)
-            raise ConnectionError(f"WebSocket failed to start: {state.get('error')}")
-
-        yield from self._pump(timeout)
-
     # -- internals ----------------------------------------------------------
-
-    def _pump(self, timeout: int) -> Generator[str, None, None]:
-        deadline = time.time() + timeout
-        any_text = False
-        while True:
-            state = self._page.evaluate(_POLL_JS)
-            for chunk in state.get("q") or []:
-                if chunk:
-                    any_text = True
-                    yield chunk
-            if state.get("error"):
-                raise RuntimeError(f"Copilot error: {state['error']}")
-            if state.get("done") and not state.get("q"):
-                break
-            if time.time() > deadline:
-                raise TimeoutError(f"No 'done' within {timeout}s")
-            time.sleep(0.08)
-
-        if not any_text and not state.get("started"):
-            raise RuntimeError("Invalid response: stream produced no text")
 
     def _ensure_started(self) -> None:
         if self._context is None or self._page is None:
