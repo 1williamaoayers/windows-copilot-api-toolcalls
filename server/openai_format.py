@@ -34,6 +34,29 @@ def completion_response(text: str, model: str, conversation_id=None) -> dict:
     }
 
 
+def tool_calls_response(tool_calls: list, model: str, conversation_id=None) -> dict:
+    """A non-streaming ``chat.completion`` object that asks the client to call tools."""
+    return {
+        "id": new_id(),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "conversation_id": conversation_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": tool_calls,
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
 def sse_event(payload: dict) -> str:
     """Serialize a payload as a Server-Sent Events ``data:`` line."""
     return f"data: {json.dumps(payload)}\n\n"

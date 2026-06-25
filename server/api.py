@@ -15,10 +15,12 @@ from .openai_format import (
     new_id,
     sse_event,
     stream_chunk,
+    tool_calls_response,
 )
 from .prompt import messages_to_prompt
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest
+from .tool_calling import build_tool_prompt, has_tools, parse_tool_calls, tool_calls_delta
 
 app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
 # Server runs headless and must never pop a visible browser mid-request. With
@@ -66,7 +68,7 @@ def _rate_limited_response():
 _upstream_lock = threading.Lock()
 
 
-def _stream(prompt: str, model: str, conversation_id=None):
+def _stream(prompt: str, model: str, conversation_id=None, req: ChatCompletionRequest = None):
     """Yield OpenAI ``chat.completion.chunk`` SSE events for ``prompt``.
 
     ``conversation_id`` continues an existing Copilot thread; ``None`` starts a
@@ -77,18 +79,34 @@ def _stream(prompt: str, model: str, conversation_id=None):
     try:
         with _upstream_lock:  # one upstream chat at a time (released on disconnect)
             yield sse_event(stream_chunk(cid, created, model, {"role": "assistant"}))
-            stream = client.stream(prompt, conversation_id=conversation_id)
-            for piece in stream:
-                if isinstance(piece, str) and piece:
-                    yield sse_event(stream_chunk(cid, created, model, {"content": piece}))
-            # Copilot's conversation id is known once the stream has run; emit it
-            # on the final chunk so callers can track the upstream thread.
-            yield sse_event(
-                stream_chunk(
-                    cid, created, model, {}, finish="stop",
-                    conversation_id=stream.conversation_id,
+            if req is not None and has_tools(req.tools):
+                tool_prompt = build_tool_prompt(prompt, req.tools, req.tool_choice, req.parallel_tool_calls)
+                reply = client.chat(tool_prompt, conversation_id=conversation_id)
+                tool_calls = parse_tool_calls(reply.text)
+                if tool_calls:
+                    yield sse_event(
+                        stream_chunk(cid, created, model, {"tool_calls": tool_calls_delta(tool_calls)})
+                    )
+                    finish = "tool_calls"
+                else:
+                    yield sse_event(stream_chunk(cid, created, model, {"content": reply.text}))
+                    finish = "stop"
+                yield sse_event(
+                    stream_chunk(cid, created, model, {}, finish=finish, conversation_id=reply.conversation_id)
                 )
-            )
+            else:
+                stream = client.stream(prompt, conversation_id=conversation_id)
+                for piece in stream:
+                    if isinstance(piece, str) and piece:
+                        yield sse_event(stream_chunk(cid, created, model, {"content": piece}))
+                # Copilot's conversation id is known once the stream has run; emit it
+                # on the final chunk so callers can track the upstream thread.
+                yield sse_event(
+                    stream_chunk(
+                        cid, created, model, {}, finish="stop",
+                        conversation_id=stream.conversation_id,
+                    )
+                )
     except ClearanceRequired:
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {_CLEARANCE_HELP}]"}, finish="error")
@@ -128,12 +146,17 @@ def chat_completions(req: ChatCompletionRequest):
 
     if req.stream:
         return StreamingResponse(
-            _stream(prompt, model, req.conversation_id), media_type="text/event-stream"
+            _stream(prompt, model, req.conversation_id, req), media_type="text/event-stream"
         )
 
     try:
         with _upstream_lock:  # serialize: one upstream chat at a time
-            reply = client.chat(prompt, conversation_id=req.conversation_id)
+            upstream_prompt = (
+                build_tool_prompt(prompt, req.tools, req.tool_choice, req.parallel_tool_calls)
+                if has_tools(req.tools)
+                else prompt
+            )
+            reply = client.chat(upstream_prompt, conversation_id=req.conversation_id)
     except ClearanceRequired:
         return JSONResponse(
             status_code=503,
@@ -144,6 +167,10 @@ def chat_completions(req: ChatCompletionRequest):
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},
         )
+    if has_tools(req.tools):
+        tool_calls = parse_tool_calls(reply.text)
+        if tool_calls:
+            return tool_calls_response(tool_calls, model, reply.conversation_id)
     return completion_response(reply.text, model, reply.conversation_id)
 
 

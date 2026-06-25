@@ -4,6 +4,8 @@ Copilot's protocol has no role/system channel — it takes one prompt string per
 turn — so we collapse the whole conversation into one piece of text.
 """
 
+import json
+
 from typing import Any, List, Optional, Union
 
 from .schemas import ChatMessage
@@ -37,8 +39,18 @@ def messages_to_prompt(messages: List[ChatMessage]) -> str:
     else:
         lines = []
         for m in convo:
-            label = "User" if m.role == "user" else "Assistant"
-            lines.append(f"{label}: {content_text(m.content)}")
+            if m.role == "user":
+                lines.append(f"User: {content_text(m.content)}")
+            elif m.role == "tool":
+                tool_id = f" {m.tool_call_id}" if m.tool_call_id else ""
+                lines.append(f"Tool result{tool_id}: {content_text(m.content)}")
+            elif m.tool_calls:
+                lines.append(
+                    "Assistant tool calls: "
+                    + json.dumps(m.tool_calls, ensure_ascii=False, separators=(",", ":"))
+                )
+            else:
+                lines.append(f"Assistant: {content_text(m.content)}")
         lines.append("Assistant:")  # cue Copilot to continue
         body = "\n".join(lines)
 

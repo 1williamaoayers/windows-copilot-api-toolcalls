@@ -10,6 +10,7 @@ You can use it in two ways:
 
 - 🐍 **As a Python library:** just call `client.chat("Hi")`. Supports streaming and multi-turn conversations.
 - 🔌 **As a local OpenAI-compatible API:** runs a server at `http://localhost:8000/v1` that speaks the OpenAI format, so the official `openai` SDK (and any OpenAI-compatible app) works as a drop-in, with `localhost` in place of OpenAI.
+- 🧰 **Tool calling shim:** this fork accepts OpenAI `tools`, `tool_choice`, `parallel_tool_calls`, assistant `tool_calls`, and `tool` messages on `/v1/chat/completions`.
 
 You sign in once in a browser with your Microsoft **or Google** account; your session is saved and refreshed automatically after that.
 
@@ -188,6 +189,39 @@ curl http://localhost:8000/v1/chat/completions \
 > Change the address with env vars: `HOST=0.0.0.0 PORT=8080 python app.py`, or run `uvicorn server.api:app --host 0.0.0.0 --port 8080`.
 
 👉 More: [examples/04_server_http.py](examples/04_server_http.py), [05_server_stream.py](examples/05_server_stream.py), [06_server_openai_sdk.py](examples/06_server_openai_sdk.py)
+
+### Tool calls
+
+This fork adds an OpenAI-compatible tool-calling shim. Copilot itself does not
+expose a native tool API, so the server describes available tools in the prompt
+and parses a strict JSON tool-call reply back into OpenAI's `tool_calls` shape.
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "copilot",
+    "messages": [{"role": "user", "content": "What is the weather in Singapore?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }],
+    "tool_choice": "auto"
+  }'
+```
+
+When Copilot chooses a tool, the response uses the standard assistant
+`tool_calls` shape and `finish_reason: "tool_calls"`. Streaming requests with
+tools are supported by buffering the upstream Copilot reply, then emitting a
+synthetic OpenAI SSE tool-call chunk.
 
 ---
 
