@@ -36,7 +36,7 @@ _CLEARANCE_HELP = (
     "Re-clear in a browser: run `python -m copilot login` (or `python tests/diagnostic.py`) "
     "and pass the 'verify you're human' check, then retry."
 )
-_MAX_COPILOT_PROMPT_CHARS = int(os.environ.get("MAX_COPILOT_PROMPT_CHARS", "18000"))
+_MAX_COPILOT_PROMPT_CHARS = int(os.environ.get("MAX_COPILOT_PROMPT_CHARS", "8000"))
 
 # Self-imposed rate limit on top of the concurrency lock below: this caps
 # requests-per-minute, the lock caps requests-in-flight. See server/ratelimit.py.

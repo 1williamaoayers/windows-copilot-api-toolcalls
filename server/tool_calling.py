@@ -49,12 +49,19 @@ def build_tool_prompt(
     if parallel_tool_calls is False:
         mode_lines.append("Call at most one tool.")
 
+    instructions = "Tool calling instructions:\n" + "\n".join(f"- {line}" for line in mode_lines)
+    tools_json = _compact_tools_json(tools)
+    if max_chars is not None:
+        fixed = len(instructions) + len("Available tools JSON:\n") + len("Conversation:\n") + 8
+        tools_budget = max(1200, min(3000, max_chars // 3))
+        if len(tools_json) > tools_budget:
+            tools_json = _compact_tools_json(tools, tools_budget)
+        prompt_budget = max(500, max_chars - fixed - len(tools_json))
+        if len(prompt) > prompt_budget:
+            prompt = prompt[-prompt_budget:]
+
     built = "\n\n".join(
-        [
-            "Tool calling instructions:\n" + "\n".join(f"- {line}" for line in mode_lines),
-            "Available tools JSON:\n" + _compact_tools_json(tools),
-            "Conversation:\n" + prompt,
-        ]
+        [instructions, "Available tools JSON:\n" + tools_json, "Conversation:\n" + prompt]
     )
     if max_chars is not None and len(built) > max_chars:
         return built[-max_chars:]
@@ -149,7 +156,7 @@ def tool_calls_delta(tool_calls: Iterable[dict]) -> List[dict]:
     return deltas
 
 
-def _compact_tools_json(tools: List[Any], max_total_chars: int = 8000) -> str:
+def _compact_tools_json(tools: List[Any], max_total_chars: int = 3000) -> str:
     compact = []
     for tool in tools:
         if not isinstance(tool, dict):
