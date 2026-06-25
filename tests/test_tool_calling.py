@@ -55,6 +55,15 @@ class ToolCallingTests(unittest.TestCase):
         self.assertIn("Tool choice requires outputting a JSON call for only this tool: lookup.", prompt)
         self.assertIn("Call at most one tool.", prompt)
 
+    def test_build_prompt_respects_max_chars(self):
+        prompt = build_tool_prompt(
+            "User: " + ("x" * 2000),
+            [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+            max_chars=500,
+        )
+
+        self.assertLessEqual(len(prompt), 500)
+
     def test_tool_calls_response_shape(self):
         resp = tool_calls_response(
             [

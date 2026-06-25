@@ -1,9 +1,10 @@
 """FastAPI app wiring Copilot onto the OpenAI Chat Completions API."""
 
+import os
 import threading
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from copilot import CopilotClient
@@ -17,7 +18,7 @@ from .openai_format import (
     stream_chunk,
     tool_calls_response,
 )
-from .prompt import messages_to_prompt
+from .prompt import compact_messages_to_prompt
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest
 from .tool_calling import build_tool_prompt, has_tools, parse_tool_calls, tool_calls_delta
@@ -35,6 +36,7 @@ _CLEARANCE_HELP = (
     "Re-clear in a browser: run `python -m copilot login` (or `python tests/diagnostic.py`) "
     "and pass the 'verify you're human' check, then retry."
 )
+_MAX_COPILOT_PROMPT_CHARS = int(os.environ.get("MAX_COPILOT_PROMPT_CHARS", "18000"))
 
 # Self-imposed rate limit on top of the concurrency lock below: this caps
 # requests-per-minute, the lock caps requests-in-flight. See server/ratelimit.py.
@@ -80,7 +82,10 @@ def _stream(prompt: str, model: str, conversation_id=None, req: ChatCompletionRe
         with _upstream_lock:  # one upstream chat at a time (released on disconnect)
             yield sse_event(stream_chunk(cid, created, model, {"role": "assistant"}))
             if req is not None and has_tools(req.tools):
-                tool_prompt = build_tool_prompt(prompt, req.tools, req.tool_choice, req.parallel_tool_calls)
+                tool_prompt = build_tool_prompt(
+                    prompt, req.tools, req.tool_choice, req.parallel_tool_calls,
+                    _MAX_COPILOT_PROMPT_CHARS,
+                )
                 reply = client.chat(tool_prompt, conversation_id=conversation_id)
                 tool_calls = parse_tool_calls(reply.text)
                 if tool_calls:
@@ -130,7 +135,7 @@ def list_models():
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
-    prompt = messages_to_prompt(req.messages)
+    prompt = compact_messages_to_prompt(req.messages, _MAX_COPILOT_PROMPT_CHARS)
     if not prompt.strip():
         return JSONResponse(
             status_code=400,
@@ -152,7 +157,10 @@ def chat_completions(req: ChatCompletionRequest):
     try:
         with _upstream_lock:  # serialize: one upstream chat at a time
             upstream_prompt = (
-                build_tool_prompt(prompt, req.tools, req.tool_choice, req.parallel_tool_calls)
+                build_tool_prompt(
+                    prompt, req.tools, req.tool_choice, req.parallel_tool_calls,
+                    _MAX_COPILOT_PROMPT_CHARS,
+                )
                 if has_tools(req.tools)
                 else prompt
             )
@@ -174,6 +182,97 @@ def chat_completions(req: ChatCompletionRequest):
     return completion_response(reply.text, model, reply.conversation_id)
 
 
+@app.post("/v1/responses")
+async def responses(req: Request):
+    """Minimal OpenAI Responses API shim for Codex-style clients."""
+    payload = await req.json()
+    chat_req = ChatCompletionRequest(
+        messages=_responses_input_to_messages(payload.get("input")),
+        model=payload.get("model") or MODEL_NAME,
+        stream=False,
+        tools=payload.get("tools"),
+        tool_choice=payload.get("tool_choice"),
+        parallel_tool_calls=payload.get("parallel_tool_calls"),
+    )
+    result = chat_completions(chat_req)
+    if isinstance(result, JSONResponse):
+        return result
+
+    choice = result["choices"][0]
+    message = choice["message"]
+    output = []
+    if message.get("tool_calls"):
+        for call in message["tool_calls"]:
+            output.append(
+                {
+                    "id": call["id"],
+                    "type": "function_call",
+                    "name": call["function"]["name"],
+                    "arguments": call["function"]["arguments"],
+                    "call_id": call["id"],
+                }
+            )
+    else:
+        output.append(
+            {
+                "id": f"msg_{new_id()[9:]}",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": message.get("content") or "",
+                    }
+                ],
+            }
+        )
+
+    return {
+        "id": f"resp_{new_id()[9:]}",
+        "object": "response",
+        "created_at": result["created"],
+        "model": result["model"],
+        "output": output,
+        "conversation_id": result.get("conversation_id"),
+        "usage": result.get("usage", {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+    }
+
+
+def _responses_input_to_messages(input_value):
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}]
+    if isinstance(input_value, list):
+        messages = []
+        for item in input_value:
+            if not isinstance(item, dict):
+                messages.append({"role": "user", "content": str(item)})
+                continue
+            if item.get("type") == "message":
+                content = item.get("content")
+                if isinstance(content, list):
+                    text = "\n".join(
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and part.get("type") in {"input_text", "output_text"}
+                    )
+                else:
+                    text = content
+                messages.append({"role": item.get("role", "user"), "content": text})
+            elif "role" in item:
+                messages.append(item)
+            elif item.get("type") == "function_call_output":
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id"),
+                        "content": item.get("output", ""),
+                    }
+                )
+        if messages:
+            return messages
+    return [{"role": "user", "content": ""}]
+
+
 @app.get("/")
 def root():
-    return {"service": "Copilot OpenAI-compatible API", "endpoints": ["/v1/models", "/v1/chat/completions"]}
+    return {"service": "Copilot OpenAI-compatible API", "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/responses"]}

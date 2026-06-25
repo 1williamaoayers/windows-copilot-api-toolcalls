@@ -24,6 +24,7 @@ def build_tool_prompt(
     tools: List[Any],
     tool_choice: Optional[Any] = None,
     parallel_tool_calls: Optional[bool] = None,
+    max_chars: Optional[int] = None,
 ) -> str:
     """Append deterministic tool-use instructions to a flattened prompt."""
     mode_lines = [
@@ -48,13 +49,16 @@ def build_tool_prompt(
     if parallel_tool_calls is False:
         mode_lines.append("Call at most one tool.")
 
-    return "\n\n".join(
+    built = "\n\n".join(
         [
             "Tool calling instructions:\n" + "\n".join(f"- {line}" for line in mode_lines),
-            "Available tools JSON:\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":")),
+            "Available tools JSON:\n" + _compact_tools_json(tools),
             "Conversation:\n" + prompt,
         ]
     )
+    if max_chars is not None and len(built) > max_chars:
+        return built[-max_chars:]
+    return built
 
 
 def parse_tool_calls(text: str) -> Optional[List[dict]]:
@@ -143,3 +147,46 @@ def tool_calls_delta(tool_calls: Iterable[dict]) -> List[dict]:
             }
         )
     return deltas
+
+
+def _compact_tools_json(tools: List[Any], max_total_chars: int = 8000) -> str:
+    compact = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            compact.append(tool)
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        item = {
+            "type": tool.get("type", "function"),
+            "function": {
+                "name": function.get("name"),
+                "description": _limit_text(function.get("description", ""), 500),
+                "parameters": function.get("parameters", {}),
+            },
+        }
+        compact.append(item)
+
+    text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if len(text) <= max_total_chars:
+        return text
+
+    names_only = []
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) and isinstance(tool.get("function"), dict) else {}
+        names_only.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": function.get("name"),
+                    "description": _limit_text(function.get("description", ""), 300),
+                },
+            }
+        )
+    return json.dumps(names_only, ensure_ascii=False, separators=(",", ":"))[:max_total_chars]
+
+
+def _limit_text(text: Any, max_chars: int) -> str:
+    text = "" if text is None else str(text)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 15] + "...[truncated]"
