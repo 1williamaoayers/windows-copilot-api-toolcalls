@@ -52,7 +52,7 @@ class ToolCallingTests(unittest.TestCase):
             False,
         )
 
-        self.assertIn("Tool choice requires calling only this tool: lookup.", prompt)
+        self.assertIn("Tool choice requires outputting a JSON call for only this tool: lookup.", prompt)
         self.assertIn("Call at most one tool.", prompt)
 
     def test_tool_calls_response_shape(self):

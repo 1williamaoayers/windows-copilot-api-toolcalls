@@ -28,6 +28,8 @@ def build_tool_prompt(
     """Append deterministic tool-use instructions to a flattened prompt."""
     mode_lines = [
         "You have access to the following tools in OpenAI Chat Completions format.",
+        "You are selecting tool calls for the HTTP client; you are not executing the tools yourself.",
+        "Do not say that tools are unavailable when a listed tool matches the request.",
         "When a tool is needed, reply with only valid JSON and no prose.",
         'Use exactly this shape: {"tool_calls":[{"name":"tool_name","arguments":{}}]}',
         "When no tool is needed, answer normally in plain text.",
@@ -36,12 +38,12 @@ def build_tool_prompt(
     if tool_choice == "none":
         mode_lines.append("Tool choice is none: do not call tools.")
     elif tool_choice == "required":
-        mode_lines.append("Tool choice is required: call one of the tools.")
+        mode_lines.append("Tool choice is required: output a JSON tool_calls object.")
     elif isinstance(tool_choice, dict):
         function = tool_choice.get("function") or {}
         name = function.get("name")
         if name:
-            mode_lines.append(f"Tool choice requires calling only this tool: {name}.")
+            mode_lines.append(f"Tool choice requires outputting a JSON call for only this tool: {name}.")
 
     if parallel_tool_calls is False:
         mode_lines.append("Call at most one tool.")
