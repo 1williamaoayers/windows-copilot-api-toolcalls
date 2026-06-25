@@ -48,9 +48,9 @@ def build_tool_prompt(
 
     return "\n\n".join(
         [
-            prompt,
             "Tool calling instructions:\n" + "\n".join(f"- {line}" for line in mode_lines),
             "Available tools JSON:\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":")),
+            "Conversation:\n" + prompt,
         ]
     )
 
